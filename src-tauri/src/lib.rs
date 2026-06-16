@@ -16,7 +16,7 @@ use tauri::Manager;
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BUILTIN_PAST_CACHE: OnceLock<Mutex<HashMap<String, ProblemRecord>>> = OnceLock::new();
 const DATASET_POLICY_VERSION: &str = "dataset-policy-v4-generator-quality";
-const GENERATION_MAX_TOKENS: u32 = 12_000;
+const GENERATION_MAX_TOKENS: u32 = 32_000;
 const TEST_CASE_SEPARATOR: &str = "---AUTO_JUDGE_CASE---";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,7 +745,8 @@ fn build_generation_prompt(request: &GenerateRequest) -> String {
 14. dataGenerator 输出多组输入时，必须在相邻两组测试输入之间单独输出一行 ---AUTO_JUDGE_CASE---，最后一组后不要再输出分隔线。每组内容必须正好是用户提交程序会读到的一次完整标准输入。
 15. referenceSolution 是标准对拍代码，本地应用会对 dataGenerator 产生的每组输入运行它，得到 expected output。
 16. testInputs 必须返回空数组 []；禁止把 10 组正式测试输入、正式输出答案或大样例内容写进 JSON。
-17. 整个 JSON 应控制在 12000 token 以内；题面可以长，但不要复述课件，不要展开生成出的测试数据。
+17. 整个 JSON 应控制在 32000 token 以内；题面可以长，但不要复述课件，不要展开生成出的测试数据。
+18. referenceSolution 和 dataGenerator 代码应完整但精炼，避免大段注释和重复代码。
 
 固定 JSON schema：
 {{
@@ -1039,9 +1040,23 @@ async fn request_generation_draft(
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
         .ok_or_else(|| "生成 API 响应缺少 choices[0].message.content".to_string())?;
+    let finish_reason = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let json_text = extract_json_object(content)?;
-    let mut draft: GeneratedProblemDraft = serde_json::from_str(&json_text)
-        .map_err(|error| format!("模型 JSON 格式错误：{error}\n{json_text}"))?;
+    let mut draft: GeneratedProblemDraft = serde_json::from_str(&json_text).map_err(|error| {
+        if finish_reason == "length" {
+            format!(
+                "模型输出被 max_tokens 截断，JSON 不完整：{error}。请重新生成，或降低难度/减少补充要求。"
+            )
+        } else {
+            format!("模型 JSON 格式错误：{error}\n{json_text}")
+        }
+    })?;
     normalize_generated_draft_text(&mut draft);
     Ok(draft)
 }
@@ -3217,7 +3232,7 @@ int main(void) {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-key"));
             assert!(request_text.contains("\"model\":\"test-model\""));
-            assert!(request_text.contains("\"max_tokens\":12000"));
+            assert!(request_text.contains("\"max_tokens\":32000"));
 
             let draft = json!({
                 "title": "两数求和",
