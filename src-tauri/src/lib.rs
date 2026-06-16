@@ -449,6 +449,13 @@ struct KnowledgeSpec {
     excerpt: &'static str,
 }
 
+fn builtin_topic_prompt(spec: &KnowledgeSpec) -> String {
+    format!(
+        "内置命题提示：围绕「{}」出题。{} 题目应贴近数据结构机试风格，弱化竞赛式巧思，强化输入解析、结构体建模、状态维护、排序/遍历/模拟过程和边界处理。",
+        spec.title, spec.excerpt
+    )
+}
+
 fn knowledge_specs() -> Vec<KnowledgeSpec> {
     vec![
         KnowledgeSpec {
@@ -597,12 +604,10 @@ fn collect_courseware_files() -> Vec<(String, PathBuf)> {
 
 fn collect_courseware_topics() -> Vec<Topic> {
     let files = collect_courseware_files();
-    if files.is_empty() {
-        return Vec::new();
-    }
     let mut topics = knowledge_specs()
         .into_iter()
-        .filter_map(|spec| {
+        .map(|spec| {
+            let prompt = builtin_topic_prompt(&spec);
             let matched = files
                 .iter()
                 .filter(|(file_name, _)| {
@@ -612,7 +617,14 @@ fn collect_courseware_topics() -> Vec<Topic> {
                 })
                 .collect::<Vec<_>>();
             if matched.is_empty() {
-                return None;
+                return Topic {
+                    id: format!("knowledge-{}", spec.id),
+                    title: spec.title.to_string(),
+                    source: "knowledge".to_string(),
+                    year: None,
+                    path: "内置知识点".to_string(),
+                    excerpt: prompt,
+                };
             }
             let source_files = matched
                 .iter()
@@ -624,14 +636,14 @@ fn collect_courseware_topics() -> Vec<Topic> {
                 .map(|(_, path)| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join("\n");
-            Some(Topic {
+            Topic {
                 id: format!("knowledge-{}", spec.id),
                 title: spec.title.to_string(),
                 source: "knowledge".to_string(),
                 year: None,
                 path: paths,
-                excerpt: format!("{} 参考课件：{}", spec.excerpt, source_files),
-            })
+                excerpt: format!("{prompt} 参考课件：{source_files}"),
+            }
         })
         .collect::<Vec<_>>();
     topics.sort_by(|first, second| first.title.cmp(&second.title));
@@ -2884,9 +2896,8 @@ int main(void) {
     #[test]
     fn courseware_topics_are_curated_knowledge_points() {
         let topics = collect_courseware_topics();
-        if topics.is_empty() {
-            return;
-        }
+        assert!(!topics.is_empty());
+        assert!(topics.len() >= knowledge_specs().len());
         assert!(topics.iter().all(|topic| topic.source == "knowledge"));
         assert!(topics.iter().all(|topic| topic.source != "ds_lz"));
         assert!(topics.iter().all(|topic| !topic.title.contains("微信图片")));
