@@ -740,13 +740,13 @@ fn build_generation_prompt(request: &GenerateRequest) -> String {
 8. 如果文件输入输出，题面要明确输入文件名和输出文件名，参考代码也要实际读写该文件。
 9. 题目风格必须贴近历年机试题：题面较长、规则描述细、算法思维不要太重，但实现代码量较高，重点考验理解题意、结构体建模、输入输出、排序、模拟和边界处理。
 10. C 参考代码必须是完整可编译的 C11 程序，不使用 C++ 语法，不依赖非标准库。
-11. dataGenerator.language 必须为 c11，code 必须是完整可编译的 C11 程序，运行后向 stdout 输出恰好 10 组测试输入。
+11. dataGenerator.language 必须为 c11，code 必须是完整可编译的 C11 程序，运行后向 stdout 输出恰好 20 组测试输入。
 12. dataGenerator 必须使用固定伪随机种子 srand(20260616)，保证同一题目每次本地生成完全一致；可以混合手工构造数据和伪随机数据，但不能依赖时间、文件、网络或系统环境。
-13. dataGenerator 的 10 组数据结构必须是：第 1-2 组为边界/最小规模，第 3-5 组为人工构造小样例，第 6-8 组为随机中大规模，第 9-10 组为极限/卡边界大规模。
-14. dataGenerator 必须覆盖容易写错的情况：重复值、相等关键字、逆序或乱序、空结果/无解输出、最大值或接近最大值；禁止 10 组都是顺序递增、形态相同的数据。
+13. dataGenerator 的 20 组数据结构必须是：第 1-10 组为小数据，覆盖边界/最小规模、人工构造样例、容易手算的中小规模；第 11-20 组为大数据，覆盖随机中大规模、接近上限、极限/卡边界规模。
+14. dataGenerator 必须覆盖容易写错的情况：重复值、相等关键字、逆序或乱序、空结果/无解输出、最大值或接近最大值；禁止 20 组都是顺序递增、形态相同的数据。
 15. dataGenerator 输出多组输入时，必须在相邻两组测试输入之间单独输出一行 ---AUTO_JUDGE_CASE---，最后一组后不要再输出分隔线。每组内容必须正好是用户提交程序会读到的一次完整标准输入。
 16. referenceSolution 是标准对拍代码，本地应用会对 dataGenerator 产生的每组输入运行它，得到 expected output。
-17. testInputs 必须返回空数组 []；禁止把 10 组正式测试输入、正式输出答案或大样例内容写进 JSON。
+17. testInputs 必须返回空数组 []；禁止把 20 组正式测试输入、正式输出答案或大样例内容写进 JSON。
 18. 整个 JSON 应控制在 32000 token 以内；题面可以长，但不要复述课件，不要展开生成出的测试数据。
 19. referenceSolution 和 dataGenerator 代码应完整但精炼，避免大段注释和重复代码。
 
@@ -1308,9 +1308,9 @@ fn test_input_scale_score(input: &str) -> usize {
 }
 
 fn validate_generated_test_inputs(inputs: &[String]) -> Result<(), String> {
-    if inputs.len() != 10 {
+    if inputs.len() != 20 {
         return Err(format!(
-            "数据生成脚本必须生成恰好 10 组正式测试输入：实际 {} 组",
+            "数据生成脚本必须生成恰好 20 组正式测试输入：实际 {} 组",
             inputs.len()
         ));
     }
@@ -1319,7 +1319,7 @@ fn validate_generated_test_inputs(inputs: &[String]) -> Result<(), String> {
         .map(|input| normalize_output(input))
         .collect::<HashSet<_>>();
     if unique.len() <= 1 {
-        return Err("数据生成脚本生成的 10 组输入完全相同，随机性和覆盖不足".to_string());
+        return Err("数据生成脚本生成的 20 组输入完全相同，随机性和覆盖不足".to_string());
     }
 
     let midpoint = inputs.len() / 2;
@@ -1337,7 +1337,7 @@ fn validate_generated_test_inputs(inputs: &[String]) -> Result<(), String> {
     let large_max = large_scores.iter().copied().max().unwrap_or(0) as f64;
 
     if large_avg < small_avg * 1.5 && large_max < small_max * 2.0 {
-        return Err("数据生成脚本没有体现前 5 组小样例、后 5 组大样例的规模差异".to_string());
+        return Err("数据生成脚本没有体现前 10 组小数据、后 10 组大数据的规模差异".to_string());
     }
     Ok(())
 }
@@ -3029,18 +3029,18 @@ mod tests {
 
     #[test]
     fn generated_test_inputs_must_have_variety_and_large_half() {
-        let identical = vec!["1 2\n".to_string(); 10];
+        let identical = vec!["1 2\n".to_string(); 20];
         assert!(validate_generated_test_inputs(&identical).is_err());
 
-        let flat = (0..10)
+        let flat = (0..20)
             .map(|index| format!("{index} {}\n", index + 1))
             .collect::<Vec<_>>();
         assert!(validate_generated_test_inputs(&flat).is_err());
 
-        let mut scaled = (0..5)
+        let mut scaled = (0..10)
             .map(|index| format!("{}\n", index + 1))
             .collect::<Vec<_>>();
-        scaled.extend((0..5).map(|index| {
+        scaled.extend((0..10).map(|index| {
             let rows = (0..(30 + index * 5))
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>()
@@ -3054,9 +3054,9 @@ mod tests {
     fn problem_record_uses_local_generator_for_formal_tests() {
         let generator_code = r#"#include <stdio.h>
 int main(void) {
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 20; ++i) {
         if (i) puts("---AUTO_JUDGE_CASE---");
-        int n = i < 5 ? i + 1 : 30 + (i - 5) * 5;
+        int n = i < 10 ? i + 1 : 30 + (i - 10) * 5;
         printf("%d\n", n);
         for (int j = 0; j < n; ++j) {
             if (j) putchar(' ');
@@ -3108,11 +3108,15 @@ int main(void) {
             draft,
         )
         .expect("generator-backed problem should build");
-        assert_eq!(record.tests.len(), 10);
+        assert_eq!(record.tests.len(), 20);
+        assert_eq!(record.tests[0].name, "small-01");
+        assert_eq!(record.tests[9].name, "small-10");
+        assert_eq!(record.tests[10].name, "large-01");
+        assert_eq!(record.tests[19].name, "large-10");
         assert_eq!(record.tests[0].input, "1\n1\n");
         assert_eq!(record.tests[0].expected_output, "1\n");
-        assert!(record.tests[9].input.starts_with("50\n"));
-        assert_eq!(record.tests[9].expected_output, "50\n");
+        assert!(record.tests[19].input.starts_with("75\n"));
+        assert_eq!(record.tests[19].expected_output, "75\n");
     }
 
     #[test]
