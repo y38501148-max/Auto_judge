@@ -1235,18 +1235,30 @@ fn run_program(
         let _ = fs::remove_file(program.work_dir.join(output_file));
     }
 
+    let stdin_mode = if io_mode.kind == "file" {
+        Stdio::null()
+    } else {
+        Stdio::piped()
+    };
+
     let mut child = Command::new(&program.binary_path)
         .current_dir(&program.work_dir)
-        .stdin(Stdio::piped())
+        .stdin(stdin_mode)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .map_err(|error| format!("无法运行编译产物：{error}"))?;
 
-    if let Some(mut child_stdin) = child.stdin.take() {
-        child_stdin
-            .write_all(input.as_bytes())
-            .map_err(|error| format!("无法写入标准输入：{error}"))?;
+    if io_mode.kind != "file" {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            if !input.is_empty() {
+                if let Err(error) = child_stdin.write_all(input.as_bytes()) {
+                    if error.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(format!("无法写入标准输入：{error}"));
+                    }
+                }
+            }
+        }
     }
 
     let started = Instant::now();
@@ -3453,7 +3465,7 @@ int main() {
     #[test]
     fn compiles_and_runs_c11_with_file_io() {
         let source = r#"
-#include <stdio.h>
+	#include <stdio.h>
 int main(void) {
     freopen("data.in", "r", stdin);
     freopen("data.out", "w", stdout);
@@ -3480,5 +3492,33 @@ int main(void) {
         let _ = fs::remove_dir_all(&compiled.work_dir);
         assert_eq!(output.status, "OK");
         assert_eq!(normalize_output(&output.stdout), "56");
+    }
+
+    #[test]
+    fn broken_pipe_while_feeding_stdio_does_not_mask_program_status() {
+        let source = r#"
+#include <stdio.h>
+int main(void) {
+    fclose(stdin);
+    return 0;
+}
+"#;
+        let compiled = compile_source("c11", source, "auto-judge-test")
+            .expect("compile command should run")
+            .expect("source should compile");
+        let large_input = format!("{}\n", "1234567890".repeat(32_768));
+        let output = run_program(
+            &compiled,
+            &large_input,
+            &IoMode {
+                kind: "stdio".to_string(),
+                input_file: None,
+                output_file: None,
+            },
+            &[],
+        )
+        .expect("broken pipe should not abort run collection");
+        let _ = fs::remove_dir_all(&compiled.work_dir);
+        assert_eq!(output.status, "OK");
     }
 }
