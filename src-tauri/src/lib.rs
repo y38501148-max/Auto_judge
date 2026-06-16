@@ -17,6 +17,7 @@ static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BUILTIN_PAST_CACHE: OnceLock<Mutex<HashMap<String, ProblemRecord>>> = OnceLock::new();
 const DATASET_POLICY_VERSION: &str = "dataset-policy-v4-generator-quality";
 const GENERATION_MAX_TOKENS: u32 = 32_000;
+const GENERATION_RETRY_LIMIT: usize = 2;
 const TEST_CASE_SEPARATOR: &str = "---AUTO_JUDGE_CASE---";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,19 +735,20 @@ fn build_generation_prompt(request: &GenerateRequest) -> String {
 3. 不要直接枚举正式测试输入或输出；必须给出 dataGenerator，本地应用会编译运行该脚本生成正式测试输入，并运行 referenceSolution 得到输出答案。
 4. 展示给用户的 samples 至少 2 组，必须全部是小规模、易阅读、输出不长的样例，避免题面网页被大输入或大输出撑长。样例 output 可以留空，后端会运行参考代码生成。
 5. 不要输出 Markdown 代码块，不要输出解释，只输出一个 JSON 对象。
-6. constraints 必须是字符串数组。
-7. 如果文件输入输出，题面要明确输入文件名和输出文件名，参考代码也要实际读写该文件。
-8. 题目风格必须贴近历年机试题：题面较长、规则描述细、算法思维不要太重，但实现代码量较高，重点考验理解题意、结构体建模、输入输出、排序、模拟和边界处理。
-9. C 参考代码必须是完整可编译的 C11 程序，不使用 C++ 语法，不依赖非标准库。
-10. dataGenerator.language 必须为 c11，code 必须是完整可编译的 C11 程序，运行后向 stdout 输出恰好 10 组测试输入。
-11. dataGenerator 必须使用固定伪随机种子 srand(20260616)，保证同一题目每次本地生成完全一致；可以混合手工构造数据和伪随机数据，但不能依赖时间、文件、网络或系统环境。
-12. dataGenerator 的 10 组数据结构必须是：第 1-2 组为边界/最小规模，第 3-5 组为人工构造小样例，第 6-8 组为随机中大规模，第 9-10 组为极限/卡边界大规模。
-13. dataGenerator 必须覆盖容易写错的情况：重复值、相等关键字、逆序或乱序、空结果/无解输出、最大值或接近最大值；禁止 10 组都是顺序递增、形态相同的数据。
-14. dataGenerator 输出多组输入时，必须在相邻两组测试输入之间单独输出一行 ---AUTO_JUDGE_CASE---，最后一组后不要再输出分隔线。每组内容必须正好是用户提交程序会读到的一次完整标准输入。
-15. referenceSolution 是标准对拍代码，本地应用会对 dataGenerator 产生的每组输入运行它，得到 expected output。
-16. testInputs 必须返回空数组 []；禁止把 10 组正式测试输入、正式输出答案或大样例内容写进 JSON。
-17. 整个 JSON 应控制在 32000 token 以内；题面可以长，但不要复述课件，不要展开生成出的测试数据。
-18. referenceSolution 和 dataGenerator 代码应完整但精炼，避免大段注释和重复代码。
+6. 所有字段都必须是合法 JSON 字符串；代码中的双引号、反斜杠和换行必须正确转义，禁止原始多行字符串。
+7. constraints 必须是字符串数组。
+8. 如果文件输入输出，题面要明确输入文件名和输出文件名，参考代码也要实际读写该文件。
+9. 题目风格必须贴近历年机试题：题面较长、规则描述细、算法思维不要太重，但实现代码量较高，重点考验理解题意、结构体建模、输入输出、排序、模拟和边界处理。
+10. C 参考代码必须是完整可编译的 C11 程序，不使用 C++ 语法，不依赖非标准库。
+11. dataGenerator.language 必须为 c11，code 必须是完整可编译的 C11 程序，运行后向 stdout 输出恰好 10 组测试输入。
+12. dataGenerator 必须使用固定伪随机种子 srand(20260616)，保证同一题目每次本地生成完全一致；可以混合手工构造数据和伪随机数据，但不能依赖时间、文件、网络或系统环境。
+13. dataGenerator 的 10 组数据结构必须是：第 1-2 组为边界/最小规模，第 3-5 组为人工构造小样例，第 6-8 组为随机中大规模，第 9-10 组为极限/卡边界大规模。
+14. dataGenerator 必须覆盖容易写错的情况：重复值、相等关键字、逆序或乱序、空结果/无解输出、最大值或接近最大值；禁止 10 组都是顺序递增、形态相同的数据。
+15. dataGenerator 输出多组输入时，必须在相邻两组测试输入之间单独输出一行 ---AUTO_JUDGE_CASE---，最后一组后不要再输出分隔线。每组内容必须正好是用户提交程序会读到的一次完整标准输入。
+16. referenceSolution 是标准对拍代码，本地应用会对 dataGenerator 产生的每组输入运行它，得到 expected output。
+17. testInputs 必须返回空数组 []；禁止把 10 组正式测试输入、正式输出答案或大样例内容写进 JSON。
+18. 整个 JSON 应控制在 32000 token 以内；题面可以长，但不要复述课件，不要展开生成出的测试数据。
+19. referenceSolution 和 dataGenerator 代码应完整但精炼，避免大段注释和重复代码。
 
 固定 JSON schema：
 {{
@@ -997,68 +999,87 @@ async fn request_generation_draft(
 ) -> Result<GeneratedProblemDraft, String> {
     let client = Client::new();
     let endpoint = chat_completions_url(&request.api_url);
-    let response = client
-        .post(&endpoint)
-        .bearer_auth(request.api_key.trim())
-        .json(&json!({
-            "model": request.model.trim(),
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是严谨的数据结构编程题命题、出数据和对拍专家。所有输出必须可机器解析。"
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.4,
-            "max_tokens": GENERATION_MAX_TOKENS,
-            "response_format": { "type": "json_object" }
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("无法请求生成 API：{error}"))?;
+    let mut last_parse_error = String::new();
 
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("无法读取生成 API 响应：{error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "生成 API 返回失败状态 {status}，请求地址 {endpoint}：{body}"
-        ));
-    }
-    let value: Value =
-        serde_json::from_str(&body).map_err(|error| format!("生成 API 响应不是 JSON：{error}"))?;
-    let content = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "生成 API 响应缺少 choices[0].message.content".to_string())?;
-    let finish_reason = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("finish_reason"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let json_text = extract_json_object(content)?;
-    let mut draft: GeneratedProblemDraft = serde_json::from_str(&json_text).map_err(|error| {
-        if finish_reason == "length" {
-            format!(
-                "模型输出被 max_tokens 截断，JSON 不完整：{error}。请重新生成，或降低难度/减少补充要求。"
-            )
+    for attempt in 0..GENERATION_RETRY_LIMIT {
+        let user_content = if attempt == 0 {
+            prompt.to_string()
         } else {
-            format!("模型 JSON 格式错误：{error}\n{json_text}")
+            format!(
+                "{prompt}\n\n上一次输出不是合法 JSON，解析错误：{last_parse_error}\n请重新输出完整 JSON 对象。特别注意：referenceSolution.code 和 dataGenerator.code 必须作为 JSON 字符串返回，代码中的双引号写成 \\\"，反斜杠写成 \\\\，换行写成 \\n。不要输出解释。"
+            )
+        };
+        let response = client
+            .post(&endpoint)
+            .bearer_auth(request.api_key.trim())
+            .json(&json!({
+                "model": request.model.trim(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "你是严谨的数据结构编程题命题、出数据和对拍专家。所有输出必须是可被 serde_json 直接解析的严格 JSON。"
+                    },
+                    {
+                        "role": "user",
+                        "content": user_content
+                    }
+                ],
+                "temperature": if attempt == 0 { 0.4 } else { 0.2 },
+                "max_tokens": GENERATION_MAX_TOKENS,
+                "response_format": { "type": "json_object" }
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("无法请求生成 API：{error}"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("无法读取生成 API 响应：{error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "生成 API 返回失败状态 {status}，请求地址 {endpoint}：{body}"
+            ));
         }
-    })?;
-    normalize_generated_draft_text(&mut draft);
-    Ok(draft)
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|error| format!("生成 API 响应不是 JSON：{error}"))?;
+        let content = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "生成 API 响应缺少 choices[0].message.content".to_string())?;
+        let finish_reason = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let json_text = extract_json_object(content)?;
+        match serde_json::from_str::<GeneratedProblemDraft>(&json_text) {
+            Ok(mut draft) => {
+                normalize_generated_draft_text(&mut draft);
+                return Ok(draft);
+            }
+            Err(error) if finish_reason == "length" => {
+                return Err(format!(
+                    "模型输出被 max_tokens 截断，JSON 不完整：{error}。请重新生成，或降低难度/减少补充要求。"
+                ));
+            }
+            Err(error) => {
+                last_parse_error = format!("{error}");
+                if attempt + 1 == GENERATION_RETRY_LIMIT {
+                    return Err(format!("模型 JSON 格式错误：{error}\n{json_text}"));
+                }
+            }
+        }
+    }
+
+    Err("模型 JSON 格式错误，自动重试后仍无法解析".to_string())
 }
 
 async fn call_generation_api(
@@ -3300,10 +3321,104 @@ int main(void) {
         assert_eq!(draft.reference_solution.language, "c11");
     }
 
+    #[tokio::test]
+    async fn request_generation_draft_retries_malformed_model_json_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server address");
+        let handle = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("mock server should accept request");
+                let mut buffer = [0_u8; 16384];
+                let bytes = stream
+                    .read(&mut buffer)
+                    .expect("mock server should read request");
+                let request_text = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                if attempt == 1 {
+                    assert!(request_text.contains("JSON"));
+                }
+
+                let content = if attempt == 0 {
+                    "{\"title\":\"坏 JSON\" \"difficulty\":\"easy\"}".to_string()
+                } else {
+                    json!({
+                        "title": "两数求和",
+                        "difficulty": "easy",
+                        "statement": "输入两个整数，输出它们的和。",
+                        "inputFormat": "一行两个整数。",
+                        "outputFormat": "一个整数。",
+                        "constraints": ["0 <= a,b <= 100"],
+                        "tags": ["基础"],
+                        "ioMode": { "kind": "stdio", "inputFile": null, "outputFile": null },
+                        "samples": [
+                            { "input": "1 2\n", "output": "" },
+                            { "input": "3 4\n", "output": "" }
+                        ],
+                        "referenceSolution": {
+                            "language": "c11",
+                            "code": "#include <stdio.h>\nint main(void){int a,b;if(scanf(\"%d%d\",&a,&b)!=2)return 0;printf(\"%d\\n\",a+b);return 0;}\n"
+                        },
+                        "dataGenerator": {
+                            "language": "c11",
+                            "code": "#include <stdio.h>\nint main(void){for(int i=0;i<10;i++){if(i)puts(\"---AUTO_JUDGE_CASE---\");printf(\"%d %d\\n\",i,i+1);}return 0;}\n"
+                        },
+                        "testInputs": []
+                    })
+                    .to_string()
+                };
+                let body = json!({
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": content
+                            }
+                        }
+                    ]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("mock server should write response");
+            }
+        });
+
+        let request = GenerateRequest {
+            api_key: "test-key".to_string(),
+            api_url: format!("http://{address}/v1/chat/completions"),
+            model: "test-model".to_string(),
+            use_cache: false,
+            topics: vec![Topic {
+                id: "knowledge-test".to_string(),
+                title: "顺序表".to_string(),
+                source: "knowledge".to_string(),
+                year: None,
+                path: String::new(),
+                excerpt: "测试考点".to_string(),
+            }],
+            difficulty: "medium".to_string(),
+            include_file_io: false,
+            extra_requirements: String::new(),
+        };
+        let draft = request_generation_draft(&request, "生成一道题")
+            .await
+            .expect("second mock response should parse");
+        handle.join().expect("mock server thread should finish");
+
+        assert_eq!(draft.title, "两数求和");
+        assert!(draft.data_generator.is_some());
+    }
+
     #[test]
     fn compiles_and_runs_cpp17_with_stdio() {
         let source = r#"
-#include <iostream>
+	#include <iostream>
 using namespace std;
 int main() {
     int a, b;
