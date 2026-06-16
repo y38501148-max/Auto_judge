@@ -16,6 +16,7 @@ use tauri::Manager;
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BUILTIN_PAST_CACHE: OnceLock<Mutex<HashMap<String, ProblemRecord>>> = OnceLock::new();
 const DATASET_POLICY_VERSION: &str = "dataset-policy-v4-generator-quality";
+const GENERATION_MAX_TOKENS: u32 = 12_000;
 const TEST_CASE_SEPARATOR: &str = "---AUTO_JUDGE_CASE---";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -730,7 +731,7 @@ fn build_generation_prompt(request: &GenerateRequest) -> String {
 固定命题规范：
 1. 题目必须是中文题面，适合 C 语言数据结构机试。
 2. 必须给出确定性参考代码，语言只能为 c11，不能生成 C++ 代码。
-3. 不要直接枚举正式测试输入；必须给出 dataGenerator，本地应用会编译运行该脚本生成正式测试输入。
+3. 不要直接枚举正式测试输入或输出；必须给出 dataGenerator，本地应用会编译运行该脚本生成正式测试输入，并运行 referenceSolution 得到输出答案。
 4. 展示给用户的 samples 至少 2 组，必须全部是小规模、易阅读、输出不长的样例，避免题面网页被大输入或大输出撑长。样例 output 可以留空，后端会运行参考代码生成。
 5. 不要输出 Markdown 代码块，不要输出解释，只输出一个 JSON 对象。
 6. constraints 必须是字符串数组。
@@ -743,6 +744,8 @@ fn build_generation_prompt(request: &GenerateRequest) -> String {
 13. dataGenerator 必须覆盖容易写错的情况：重复值、相等关键字、逆序或乱序、空结果/无解输出、最大值或接近最大值；禁止 10 组都是顺序递增、形态相同的数据。
 14. dataGenerator 输出多组输入时，必须在相邻两组测试输入之间单独输出一行 ---AUTO_JUDGE_CASE---，最后一组后不要再输出分隔线。每组内容必须正好是用户提交程序会读到的一次完整标准输入。
 15. referenceSolution 是标准对拍代码，本地应用会对 dataGenerator 产生的每组输入运行它，得到 expected output。
+16. testInputs 必须返回空数组 []；禁止把 10 组正式测试输入、正式输出答案或大样例内容写进 JSON。
+17. 整个 JSON 应控制在 12000 token 以内；题面可以长，但不要复述课件，不要展开生成出的测试数据。
 
 固定 JSON schema：
 {{
@@ -839,6 +842,154 @@ fn extract_json_object(content: &str) -> Result<String, String> {
     Ok(content[start..=end].to_string())
 }
 
+fn is_probable_windows_path_escape(chars: &[char], slash_index: usize) -> bool {
+    let escaped = chars.get(slash_index + 1).copied().unwrap_or_default();
+    let after_escape = slash_index + 2;
+    if after_escape >= chars.len() || chars[after_escape].is_whitespace() {
+        return false;
+    }
+    if after_escape + 1 < chars.len()
+        && chars[after_escape].is_ascii_alphabetic()
+        && chars[after_escape + 1] == ':'
+    {
+        return false;
+    }
+
+    if slash_index > 0 && chars[slash_index - 1] == '\\' {
+        return true;
+    }
+
+    let mut token_start = 0;
+    for index in (0..slash_index).rev() {
+        if chars[index].is_whitespace()
+            || (index > 0 && chars[index - 1] == '\\' && matches!(chars[index], 'n' | 'r'))
+        {
+            token_start = index + 1;
+            break;
+        }
+    }
+    let token_prefix = &chars[token_start..slash_index];
+    if token_prefix.len() >= 2 && token_prefix[0].is_ascii_alphabetic() && token_prefix[1] == ':' {
+        return true;
+    }
+
+    escaped.is_ascii_alphanumeric()
+        && (token_prefix.len() >= 2 && token_prefix[0] == '\\' && token_prefix[1] == '\\')
+}
+
+fn normalize_model_text_newlines(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.contains("\\n") && !normalized.contains("\\r") {
+        return normalized;
+    }
+
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(normalized.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && index + 1 < chars.len() {
+            match chars[index + 1] {
+                'n' if !is_probable_windows_path_escape(&chars, index) => {
+                    output.push('\n');
+                    index += 2;
+                    continue;
+                }
+                'r' if !is_probable_windows_path_escape(&chars, index) => {
+                    if index + 3 < chars.len()
+                        && chars[index + 2] == '\\'
+                        && chars[index + 3] == 'n'
+                    {
+                        output.push('\n');
+                        index += 4;
+                    } else {
+                        output.push('\n');
+                        index += 2;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+    output
+}
+
+fn normalize_generated_draft_text(draft: &mut GeneratedProblemDraft) {
+    draft.title = normalize_model_text_newlines(&draft.title);
+    draft.statement = normalize_model_text_newlines(&draft.statement);
+    draft.input_format = normalize_model_text_newlines(&draft.input_format);
+    draft.output_format = normalize_model_text_newlines(&draft.output_format);
+    draft.constraints = draft
+        .constraints
+        .iter()
+        .map(|item| normalize_model_text_newlines(item))
+        .collect();
+    draft.tags = draft
+        .tags
+        .iter()
+        .map(|item| normalize_model_text_newlines(item))
+        .collect();
+    draft.samples = draft
+        .samples
+        .iter()
+        .map(|sample| SampleCase {
+            input: normalize_model_text_newlines(&sample.input),
+            output: sample
+                .output
+                .as_ref()
+                .map(|output| normalize_model_text_newlines(output)),
+        })
+        .collect();
+    draft.test_inputs = draft
+        .test_inputs
+        .iter()
+        .map(|input| normalize_model_text_newlines(input))
+        .collect();
+}
+
+fn normalize_test_case_text(case: &mut TestCase) {
+    case.input = normalize_model_text_newlines(&case.input);
+    case.expected_output = normalize_model_text_newlines(&case.expected_output);
+    case.files = case
+        .files
+        .iter()
+        .map(|file| TestFile {
+            name: file.name.clone(),
+            content: normalize_model_text_newlines(&file.content),
+        })
+        .collect();
+}
+
+fn normalize_problem_record_text(record: &mut ProblemRecord) {
+    record.title = normalize_model_text_newlines(&record.title);
+    record.statement = normalize_model_text_newlines(&record.statement);
+    record.input_format = normalize_model_text_newlines(&record.input_format);
+    record.output_format = normalize_model_text_newlines(&record.output_format);
+    record.constraints = record
+        .constraints
+        .iter()
+        .map(|item| normalize_model_text_newlines(item))
+        .collect();
+    record.tags = record
+        .tags
+        .iter()
+        .map(|item| normalize_model_text_newlines(item))
+        .collect();
+    record.topic_titles = record
+        .topic_titles
+        .iter()
+        .map(|item| normalize_model_text_newlines(item))
+        .collect();
+    for case in &mut record.samples {
+        normalize_test_case_text(case);
+    }
+    for case in &mut record.tests {
+        normalize_test_case_text(case);
+    }
+}
+
 async fn request_generation_draft(
     request: &GenerateRequest,
     prompt: &str,
@@ -861,6 +1012,7 @@ async fn request_generation_draft(
                 }
             ],
             "temperature": 0.4,
+            "max_tokens": GENERATION_MAX_TOKENS,
             "response_format": { "type": "json_object" }
         }))
         .send()
@@ -888,8 +1040,10 @@ async fn request_generation_draft(
         .and_then(Value::as_str)
         .ok_or_else(|| "生成 API 响应缺少 choices[0].message.content".to_string())?;
     let json_text = extract_json_object(content)?;
-    serde_json::from_str(&json_text)
-        .map_err(|error| format!("模型 JSON 格式错误：{error}\n{json_text}"))
+    let mut draft: GeneratedProblemDraft = serde_json::from_str(&json_text)
+        .map_err(|error| format!("模型 JSON 格式错误：{error}\n{json_text}"))?;
+    normalize_generated_draft_text(&mut draft);
+    Ok(draft)
 }
 
 async fn call_generation_api(
@@ -899,16 +1053,22 @@ async fn call_generation_api(
     validate_generation_request(request)?;
     let prompt = build_generation_prompt(request);
     let cache_key = cache_key_for_request(request, &prompt);
-    if request.use_cache {
+    let mut draft = if request.use_cache {
         if let Some(draft) = read_cached_draft(app, &cache_key)? {
-            return Ok(draft);
+            draft
+        } else {
+            request_generation_draft(request, &prompt)
+                .await
+                .map_err(|error| format!("{error}"))?
         }
-    }
-    let mut draft = request_generation_draft(request, &prompt)
-        .await
-        .map_err(|error| format!("{error}"))?;
-    if draft.data_generator.is_none() && draft.test_inputs.len() < 10 {
-        return Err("模型没有返回 dataGenerator，且正式测试输入少于 10 组".to_string());
+    } else {
+        request_generation_draft(request, &prompt)
+            .await
+            .map_err(|error| format!("{error}"))?
+    };
+    normalize_generated_draft_text(&mut draft);
+    if draft.data_generator.is_none() {
+        return Err("模型没有返回 dataGenerator。为避免输出 token 失控，正式测试数据必须由本地生成脚本产生。".to_string());
     }
     if draft.samples.is_empty() {
         return Err("模型没有返回样例".to_string());
@@ -926,6 +1086,7 @@ async fn call_generation_api(
     }
     draft.reference_solution.language = "c11".to_string();
     draft.difficulty = request.difficulty.clone();
+    draft.test_inputs.clear();
     if draft.io_mode.kind == "file" {
         if draft
             .io_mode
@@ -2501,7 +2662,10 @@ fn load_problem_record(app: &tauri::AppHandle, problem_id: &str) -> Result<Probl
         .join(problem_id)
         .join("problem.json");
     let content = fs::read_to_string(path).map_err(|error| format!("无法读取题目历史：{error}"))?;
-    serde_json::from_str(&content).map_err(|error| format!("题目历史格式错误：{error}"))
+    let mut record: ProblemRecord =
+        serde_json::from_str(&content).map_err(|error| format!("题目历史格式错误：{error}"))?;
+    normalize_problem_record_text(&mut record);
+    Ok(record)
 }
 
 fn delete_problem_record(
@@ -2733,6 +2897,48 @@ mod tests {
             normalize_output("1  2\r\n3\n"),
             normalize_output("1 2 3\n\n")
         );
+    }
+
+    #[test]
+    fn model_text_newline_escapes_are_decoded_before_display() {
+        let code = "#include <stdio.h>\nint main(void){printf(\"%d\\n\", 1);return 0;}\n";
+        let mut draft = GeneratedProblemDraft {
+            title: "路径整理".to_string(),
+            difficulty: "easy".to_string(),
+            statement: "第一段规则\\n第二段规则\\r\\n第三段规则".to_string(),
+            input_format: "第一行 n\\n随后 n 行记录。".to_string(),
+            output_format: "按要求输出。".to_string(),
+            constraints: vec!["1 <= n <= 10\\n路径可能包含 Windows 盘符。".to_string()],
+            tags: vec!["字符串".to_string()],
+            io_mode: IoMode {
+                kind: "stdio".to_string(),
+                input_file: None,
+                output_file: None,
+            },
+            samples: vec![SampleCase {
+                input: "2\\nD:\\new.txt\\nD:\\root.txt\\n".to_string(),
+                output: Some("D:\\new.txt\\n".to_string()),
+            }],
+            reference_solution: ReferenceSolution {
+                language: "c11".to_string(),
+                code: code.to_string(),
+            },
+            data_generator: None,
+            test_inputs: vec!["1\\nD:\\note.txt\\n".to_string()],
+        };
+
+        normalize_generated_draft_text(&mut draft);
+
+        assert_eq!(draft.statement, "第一段规则\n第二段规则\n第三段规则");
+        assert_eq!(draft.input_format, "第一行 n\n随后 n 行记录。");
+        assert_eq!(
+            draft.constraints[0],
+            "1 <= n <= 10\n路径可能包含 Windows 盘符。"
+        );
+        assert_eq!(draft.samples[0].input, "2\nD:\\new.txt\nD:\\root.txt\n");
+        assert_eq!(draft.samples[0].output.as_deref(), Some("D:\\new.txt\n"));
+        assert_eq!(draft.test_inputs[0], "1\nD:\\note.txt\n");
+        assert_eq!(draft.reference_solution.code, code);
     }
 
     #[test]
@@ -3011,6 +3217,7 @@ int main(void) {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-key"));
             assert!(request_text.contains("\"model\":\"test-model\""));
+            assert!(request_text.contains("\"max_tokens\":12000"));
 
             let draft = json!({
                 "title": "两数求和",
