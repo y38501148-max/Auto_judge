@@ -1,0 +1,33 @@
+{
+  "name": "auto-judge",
+  "version": "0.1.0",
+  "description": "数据结构自动生题与本地评测桌面应用",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "dev:web": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build:web": "npm run typecheck && vite build",
+    "build": "tauri build",
+    "pack:mac": "tauri build --bundles dmg",
+    "pack:mac:universal": "tauri build --bundles dmg --target universal-apple-darwin",
+    "pack:win": "tauri build --bundles nsis",
+    "pack:win:cross": "bash scripts/build-windows-nsis.sh"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "~5.7.3",
+    "vite": "^8.0.16"
+  }
+}
